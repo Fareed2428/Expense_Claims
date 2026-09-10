@@ -1,0 +1,249 @@
+// Expense Claims — database schema
+//
+// See docs/IMPLEMENTATION_PLAN.md Section 3 for the design rationale behind
+// each model and relationship. This file is the source of truth for the
+// data model; keep it in sync with that document if either changes.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  STAFF
+  MANAGER
+  FINANCE
+}
+
+/// PARSED -> SUBMITTED -> APPROVED|REJECTED -> PAID (terminal).
+/// REJECTED -> SUBMITTED is allowed (resubmit after correction).
+/// PAID never transitions to anything else. See docs/IMPLEMENTATION_PLAN.md
+/// Section 5 for the full state machine; that logic is enforced in
+/// application code, not by the database.
+enum ClaimStatus {
+  PARSED
+  SUBMITTED
+  APPROVED
+  REJECTED
+  PAID
+}
+
+enum ExpenseCategory {
+  TRAVEL
+  MEALS
+  SUPPLIES
+  TAXI
+  OTHER
+}
+
+enum ReceiptSourceType {
+  PASTED_TEXT
+  IMAGE_OCR
+}
+
+enum DuplicateMatchType {
+  EXACT_HASH
+  FUZZY_TEXT
+  FIELD_MATCH
+}
+
+enum ClaimEventType {
+  CREATED
+  PARSED
+  EDITED
+  SUBMITTED
+  DUPLICATE_FLAGGED
+  DUPLICATE_ACKNOWLEDGED
+  APPROVED
+  REJECTED
+  PAID
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+model User {
+  id    String   @id @default(cuid())
+  name  String
+  email String   @unique
+  role  UserRole
+
+  /// Self-referential reporting line. Nullable: Finance users and the
+  /// top of the management chain have no manager. A manager's own claims
+  /// route to *this* field's target for approval (see the self-approval
+  /// rule enforced in application code, Section 5 of the implementation
+  /// plan) — never to the manager themself.
+  managerId     String?
+  manager       User?   @relation("UserManager", fields: [managerId], references: [id], onDelete: SetNull)
+  directReports User[]  @relation("UserManager")
+
+  /// Overall monthly claimable limit for this user, used by Finance's
+  /// monthly spend/over-limit reporting (Section 8 of the implementation
+  /// plan). One figure per user, not per category.
+  monthlyLimit Decimal @db.Decimal(10, 2)
+
+  createdAt DateTime @default(now())
+
+  claimsFiled                 Claim[]      @relation("ClaimClaimant")
+  claimsToApprove             Claim[]      @relation("ClaimApprover")
+  claimsPaid                  Claim[]      @relation("ClaimPayer")
+  claimsDuplicateAcknowledged Claim[]      @relation("ClaimDuplicateAcknowledger")
+  claimEvents                 ClaimEvent[]
+}
+
+model Claim {
+  id String @id @default(cuid())
+
+  claimantId String
+  claimant   User   @relation("ClaimClaimant", fields: [claimantId], references: [id], onDelete: Restrict)
+
+  /// The manager assigned to review this claim, resolved at submission
+  /// time. Nullable because a freshly-parsed, not-yet-submitted claim has
+  /// no approver yet.
+  approverId String?
+  approver   User?   @relation("ClaimApprover", fields: [approverId], references: [id], onDelete: SetNull)
+
+  status         ClaimStatus     @default(PARSED)
+  category       ExpenseCategory
+  merchant       String
+  amount         Decimal         @db.Decimal(10, 2)
+  currency       String          @default("INR")
+  expenseDate    DateTime        @db.Date
+  description    String
+  rawReceiptText String
+
+  duplicateFlag  Boolean @default(false)
+  duplicateScore Float?
+
+  /// Set once Finance has explicitly acknowledged the duplicate warning
+  /// on a flagged claim. Phase 6's payClaim() refuses to pay a
+  /// duplicateFlag=true claim until this is set — the "flag, don't
+  /// block at filing, but require acknowledgement before money moves"
+  /// policy from CLAUDE.md/the implementation plan needs somewhere to
+  /// durably record that the acknowledgement actually happened, which
+  /// the pre-Phase-6 schema had no field for.
+  duplicateAcknowledgedAt   DateTime?
+  duplicateAcknowledgedById String?
+  duplicateAcknowledgedBy   User?     @relation("ClaimDuplicateAcknowledger", fields: [duplicateAcknowledgedById], references: [id], onDelete: SetNull)
+
+  submittedAt  DateTime?
+  decidedAt    DateTime?
+  decisionNote String?
+
+  paidAt   DateTime?
+  paidById String?
+  paidBy   User?     @relation("ClaimPayer", fields: [paidById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  receipt Receipt?
+  events  ClaimEvent[]
+
+  /// Duplicate matches where *this* claim is the newer one being checked.
+  duplicatesFound   DuplicateMatch[] @relation("ClaimDuplicateSource")
+  /// Duplicate matches where *this* claim is the earlier one being pointed to.
+  duplicateOfOthers DuplicateMatch[] @relation("ClaimDuplicateMatched")
+
+  @@index([claimantId])
+  @@index([approverId])
+  @@index([status])
+  @@index([expenseDate])
+}
+
+/// Parsed receipt data for a claim (1:1). Kept separate from Claim so what
+/// the parser/OCR originally produced stays distinguishable from what the
+/// claim record says after the user reviews and corrects it.
+model Receipt {
+  id String @id @default(cuid())
+
+  claimId String @unique
+  claim   Claim  @relation(fields: [claimId], references: [id], onDelete: Cascade)
+
+  sourceType ReceiptSourceType
+
+  rawText        String
+  /// Lowercased, whitespace-collapsed, punctuation-stripped copy of
+  /// rawText, used by duplicate detection (Section 7 of the implementation
+  /// plan) so matching isn't sensitive to formatting differences.
+  normalizedText String
+  /// SHA-256 of normalizedText — indexed for O(1) exact-duplicate lookups.
+  textHash       String
+
+  parsedMerchant  String?
+  parsedDate      DateTime?        @db.Date
+  parsedAmount    Decimal?         @db.Decimal(10, 2)
+  parsedCategory  ExpenseCategory?
+  /// Rough 0–1 confidence the parser assigns its own extraction, used to
+  /// decide which fields to highlight for the user to double-check.
+  parseConfidence Float?
+  /// Human-readable warnings the parser produced for this text (e.g.
+  /// "Could not determine the expense date") — see lib/receipt-parser.ts's
+  /// ParsedReceipt.warnings. Stored so the claim-review UI (Phase 7) can
+  /// show them back to the user; previously computed and then discarded.
+  parseWarnings   String[]         @default([])
+
+  /// Populated only if the photo/screenshot (OCR) input path is built.
+  imageUrl String?
+
+  createdAt DateTime @default(now())
+
+  @@index([textHash])
+}
+
+/// Records *why* a claim was flagged as a possible duplicate, so the UI can
+/// show "this looks like claim #X" instead of a bare boolean, and so the
+/// decision is auditable later.
+model DuplicateMatch {
+  id String @id @default(cuid())
+
+  /// The newer claim being checked.
+  claimId String
+  claim   Claim  @relation("ClaimDuplicateSource", fields: [claimId], references: [id], onDelete: Cascade)
+
+  /// The earlier claim it resembles.
+  matchedClaimId String
+  matchedClaim   Claim  @relation("ClaimDuplicateMatched", fields: [matchedClaimId], references: [id], onDelete: Cascade)
+
+  matchType DuplicateMatchType
+  /// 0–1 similarity score for this specific signal.
+  score     Float
+
+  createdAt DateTime @default(now())
+
+  @@index([claimId])
+  @@index([matchedClaimId])
+}
+
+/// Append-only audit trail of every state transition and key action on a
+/// claim — what makes "paid claims don't go backwards" and "manager can't
+/// approve their own claim" demonstrably true rather than just asserted.
+model ClaimEvent {
+  id String @id @default(cuid())
+
+  claimId String
+  claim   Claim  @relation(fields: [claimId], references: [id], onDelete: Cascade)
+
+  /// Null for system-generated events (e.g. an automatic duplicate flag),
+  /// set for anything a person did.
+  actorId String?
+  actor   User?   @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  eventType  ClaimEventType
+  fromStatus ClaimStatus?
+  toStatus   ClaimStatus?
+  note       String?
+
+  createdAt DateTime @default(now())
+
+  @@index([claimId])
+}
